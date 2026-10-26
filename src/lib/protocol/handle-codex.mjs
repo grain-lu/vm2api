@@ -19,6 +19,8 @@ import {
   isToolArgumentsError,
   toCodexResponses,
 } from './codex-convert.mjs'
+// patch(chat-shape) 2026-10-26: 非流式 chat 需转标准 chat.completion
+import { fromClaudeToOpenAIChat } from './convert.mjs'
 import {
   extraFromCodexHeaders,
   codexCreditsFromHeaders,
@@ -610,7 +612,13 @@ export async function handleCodexProtocol({
       },
     })
   }
-  const stream = inbound?.stream !== false && ctx.body?.stream !== false
+  // patch(stream-default) 2026-10-26: stream 缺省按规范应为 false(原 undefined!==false 恒 true)
+  const clientWantsStream =
+    inbound?.stream === true ||
+    inbound?.stream === 1 ||
+    inbound?.stream === 'true' ||
+    String(req.headers?.accept || '').toLowerCase().includes('text/event-stream')
+  const stream = clientWantsStream && ctx.body?.stream !== false
   const inboundSession = sessionFrom(req, converted.body)
   const sessionMode = outboundSessionMode(routing)
   const callerSession = extractCallerSession({
@@ -923,6 +931,11 @@ export async function handleCodexProtocol({
               body =
                 protocol === 'anthropic.messages'
                   ? codexBodyToAnthropicMessage(assembled, converted.body.model)
+                : protocol === 'openai.chat'
+                  ? fromClaudeToOpenAIChat(
+                      codexBodyToAnthropicMessage(assembled, converted.body.model),
+                      converted.body.model,
+                    )
                   : assembled
             } catch (error) {
               if (!isToolArgumentsError(error)) throw error
