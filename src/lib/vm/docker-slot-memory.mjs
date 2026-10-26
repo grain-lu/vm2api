@@ -210,7 +210,13 @@ export function raiseDockerSlotMemory(projectRoot, vm, requestedMemory, { routin
     })
   }
   const requestedBytes = memoryMiB(mem) * 1024 ** 2
-  if (inspected.bytes !== requestedBytes || inspected.swapBytes !== requestedBytes) {
+  // patch(swap-unsupported) 2026-10-26: 内核未开 swap 记账(cgroup v1 无 swapaccount=1)时
+  // docker 把 MemorySwap 置 -1/0(无上限),此时只核对 memory 本身,与上游 cgroup 哨兵降级同哲学
+  const swapMatches =
+    inspected.swapBytes === requestedBytes ||
+    inspected.swapBytes === -1 ||
+    inspected.swapBytes === 0
+  if (inspected.bytes !== requestedBytes || !swapMatches) {
     return failAfterDockerUpdate(vm, before, execImpl, {
       ok: false,
       code: 'memory_diverged',
