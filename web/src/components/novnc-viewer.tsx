@@ -14,6 +14,7 @@ export type NoVncHandle = {
 // X11 keysym 标准值（noVNC 的 KeyTable 未从包入口导出，直接内联）
 const XK_Control_L = 0xffe3
 const XK_v = 0x0076
+const XK_c = 0x0063
 const XK_Return = 0xff0d
 const XK_Tab = 0xff09
 
@@ -151,6 +152,15 @@ export function NoVncViewer({
       rfb.sendKey(XK_Control_L, 'ControlLeft', false)
     }
 
+    // 注入 Ctrl+C 键序：远端执行复制，剪贴板内容随后经 ServerCutText 推回
+    const injectCtrlC = () => {
+      if (!rfb) return
+      rfb.sendKey(XK_Control_L, 'ControlLeft', true)
+      rfb.sendKey(XK_c, 'KeyC', true)
+      rfb.sendKey(XK_c, 'KeyC', false)
+      rfb.sendKey(XK_Control_L, 'ControlLeft', false)
+    }
+
     // 非 Latin-1 文本逐字符注入：sendKey 不传 down 时自动发按下+抬起一对，
     // code 传 null 走标准 KeyEvent（任意 keysym 均可，x11vnc 动态绑键）
     const typeText = (text: string) => {
@@ -192,6 +202,16 @@ export function NoVncViewer({
     const onHostKeyDown = (e: KeyboardEvent) => {
       if (!rfb) return
       if (isEditable(e.target)) return
+      // Cmd/Ctrl+C：noVNC 会 preventDefault 导致本机 copy 事件不派发，本机
+      // 剪贴板拿不到桌面内容（只能依赖无感同步，flag/聚焦一失败就粘出旧值）。
+      // 拦掉 noVNC 自己注入远端 Ctrl+C，同时让 copy 事件照常派发——onDocCopy
+      // 把 remoteClip 写进本机剪贴板（先保底旧值，ServerCutText 到达后无感
+      // 同步再刷新为本次复制的内容）。
+      if ((e.metaKey || e.ctrlKey) && e.code === 'KeyC') {
+        e.stopImmediatePropagation()
+        injectCtrlC()
+        return
+      }
       // Cmd/Ctrl+V 直通：拦掉 noVNC 的直接转发，交给浏览器 paste 事件统一
       // 处理（sendPaste 按内容分流后注入）。不 preventDefault：paste 事件必须能派发。
       if ((e.metaKey || e.ctrlKey) && e.code === 'KeyV') {
