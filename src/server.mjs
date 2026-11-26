@@ -116,6 +116,7 @@ import {
 import { hostProxyUrlForVm } from './lib/vm/slot-host.mjs'
 import { refreshCodexAccessToken } from './lib/protocol/codex-models.mjs'
 import { clearOpenAIAccountHold } from './lib/pool/openai-account-runtime.mjs'
+import { withCredentialRefreshLock } from './lib/transport/go-worker-client.mjs'
 import { extraIsLiveOpen, parseResetMs } from './lib/pool/quota-window.mjs'
 import { createCragSubscription } from './lib/vm/crag-subscription.mjs'
 import { createCragRuntimeInventory } from './lib/vm/crag-runtime-inventory.mjs'
@@ -1052,52 +1053,61 @@ async function refreshWorkerCredentialForVm({ vmId, vmPath, homeDir, vm, force =
 async function refreshCodexCredentialForVm({ projectRoot, vm }) {
   const vmId = vm?.id
   if (!projectRoot || !vmId) return { ok: false, refresh_class: 'retryable', error: { code: 'vm_missing' } }
-  const first = readCodexAccounts(projectRoot, vmId)[0] || {}
-  const refreshToken = String(first.refresh_token || '').trim()
-  if (!refreshToken) {
-    return { ok: false, refresh_class: 'failed', error: { code: 'missing_refresh_token', message: 'no refresh token' } }
-  }
-  const result = await refreshCodexAccessToken({
-    refreshToken,
-    proxyUrl: hostProxyUrlForVm(vm),
-  })
-  if (result?.ok) {
-    upsertCodexAccount(projectRoot, vmId, {
-      access_token: result.access_token,
-      refresh_token: result.refresh_token || refreshToken,
-      id_token: result.id_token || first.id_token,
-      expires_at: result.expires_at || first.expires_at,
+  // 与面板刷新按钮 / quota 轮换 / search 刷新共锁：串行化同号 RT 消费，
+  // 防轮换竞态（先完成者的新票被后完成者的旧 AT 覆盖）。
+  return withCredentialRefreshLock(`codex:${vmId}`, async () => {
+    const first = readCodexAccounts(projectRoot, vmId)[0] || {}
+    const refreshToken = String(first.refresh_token || '').trim()
+    if (!refreshToken) {
+      return { ok: false, refresh_class: 'failed', error: { code: 'missing_refresh_token', message: 'no refresh token' } }
+    }
+    const result = await refreshCodexAccessToken({
+      refreshToken,
+      proxyUrl: hostProxyUrlForVm(vm),
     })
-    // 活票：清陈旧 refresh 标 + 内存 hold（与面板刷新成功路径同语义）。
-    try {
-      persistCodexCredentialState(projectRoot, vmId, { error: null })
-    } catch {}
-    try {
-      clearOpenAIAccountHold(vmId)
-    } catch {}
-    return { ok: true, status: 200, refreshed: true, refresh_class: 'rotated' }
-  }
-  const code = String(result?.error || 'refresh_failed')
-  if (code === 'oauth_revoked') {
-    // 吊销=终态：落标摘池（幂等、不覆盖其他诊断），下轮 isCodexCredentialRefreshTarget 排除。
-    try {
-      persistCodexCredentialState(projectRoot, vmId, { error: 'oauth_revoked' })
-      markCodexGrantDead(projectRoot, vmId, {
-        description: result?.description || 'token endpoint answered revocation',
-        status: result?.status || null,
+    if (result?.ok) {
+      // 锁内重读：可能是等待期间并发方已轮换的新票，别拿旧快照覆盖。
+      const latest = readCodexAccounts(projectRoot, vmId)[0] || {}
+      if (latest.refresh_token && latest.refresh_token !== first.refresh_token) {
+        return { ok: true, status: 200, refreshed: false, refresh_class: 'already_fresh' }
+      }
+      upsertCodexAccount(projectRoot, vmId, {
+        access_token: result.access_token,
+        refresh_token: result.refresh_token || refreshToken,
+        id_token: result.id_token || first.id_token,
+        expires_at: result.expires_at || first.expires_at,
       })
-    } catch {}
-    return { ok: false, refresh_class: 'fatal', error: { code: 'oauth_revoked' } }
-  }
-  if (code === 'refresh_rejected') {
-    // 结构性拒绝但非吊销文案：落标供面板归因，不摘池（与 openai-quota rotateIfNeeded 同口径）。
-    try {
-      persistCodexCredentialState(projectRoot, vmId, { error: 'refresh_rejected' })
-    } catch {}
-    return { ok: false, refresh_class: 'failed', error: { code: 'refresh_rejected' } }
-  }
-  // timeout / fetch_failed / 4xx/5xx 模糊拒绝：瞬态，不落标。
-  return { ok: false, refresh_class: 'retryable', error: { code } }
+      // 活票：清陈旧 refresh 标 + 内存 hold（与面板刷新成功路径同语义）。
+      try {
+        persistCodexCredentialState(projectRoot, vmId, { error: null })
+      } catch {}
+      try {
+        clearOpenAIAccountHold(vmId)
+      } catch {}
+      return { ok: true, status: 200, refreshed: true, refresh_class: 'rotated' }
+    }
+    const code = String(result?.error || 'refresh_failed')
+    if (code === 'oauth_revoked') {
+      // 吊销=终态：落标摘池（幂等、不覆盖其他诊断），下轮 isCodexCredentialRefreshTarget 排除。
+      try {
+        persistCodexCredentialState(projectRoot, vmId, { error: 'oauth_revoked' })
+        markCodexGrantDead(projectRoot, vmId, {
+          description: result?.description || 'token endpoint answered revocation',
+          status: result?.status || null,
+        })
+      } catch {}
+      return { ok: false, refresh_class: 'fatal', error: { code: 'oauth_revoked' } }
+    }
+    if (code === 'refresh_rejected') {
+      // 结构性拒绝但非吊销文案：落标供面板归因，不摘池（与 openai-quota rotateIfNeeded 同口径）。
+      try {
+        persistCodexCredentialState(projectRoot, vmId, { error: 'refresh_rejected' })
+      } catch {}
+      return { ok: false, refresh_class: 'failed', error: { code: 'refresh_rejected' } }
+    }
+    // timeout / fetch_failed / 4xx/5xx 模糊拒绝：瞬态，不落标。
+    return { ok: false, refresh_class: 'retryable', error: { code } }
+  })
 }
 
 const { json, writeSSEHeaders, readBody, readRawBody } = createRespond(cfg, {

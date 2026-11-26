@@ -76,6 +76,7 @@ import {
 } from '../identity/identity-rewrite.mjs'
 import { clientIp } from '../pool/sticky-router.mjs'
 import { compileWithProtoFront, protoFrontMode, transcodeWithProtoFront } from '../transport/proto-front-client.mjs'
+import { withCredentialRefreshLock } from '../transport/go-worker-client.mjs'
 
 // Official Codex client headers for ChatGPT Responses. Auth is attached by the kernel.
 const CODEX_KERNEL_HEADER_ALLOWLIST = Object.freeze([
@@ -1456,19 +1457,24 @@ function refreshSearchAccess(projectRoot, vm, usedAccess, { proxyUrl, fetchImpl,
   if (!now.refresh) return ''
   let pending = searchRefreshes.get(vm.id)
   if (!pending) {
-    pending = (async () => {
-      const tok = await refresh({ refreshToken: now.refresh, proxyUrl, fetchImpl })
+    // 与监视器/面板刷新/quota 轮换共锁（key=codex:<vmId>）：searchRefreshes 只去重
+    // 本路径并发，锁才挡跨路径的同号 RT 竞争。
+    pending = withCredentialRefreshLock(`codex:${vm.id}`, async () => {
+      // 锁内重读：等待期间并发方可能已轮换出新票，直接采用。
+      const again = searchCredentials(projectRoot, vm)
+      if (again.access && again.access !== usedAccess) return again.access
+      const tok = await refresh({ refreshToken: again.refresh || now.refresh, proxyUrl, fetchImpl })
       // 吊销定论穿透共享缓存：并发等同一个 pending 的调用方都能看到 grant death。
       if (!tok?.ok && tok?.error === 'oauth_revoked') return `grant-dead:${tok.error}`
       if (!tok?.ok || !tok.access_token) return ''
       upsertCodexAccount(projectRoot, vm.id, {
         access_token: tok.access_token,
-        refresh_token: tok.refresh_token || now.refresh,
-        id_token: tok.id_token || now.first.id_token,
-        expires_at: tok.expires_at || now.first.expires_at,
+        refresh_token: tok.refresh_token || again.refresh || now.refresh,
+        id_token: tok.id_token || again.first.id_token,
+        expires_at: tok.expires_at || again.first.expires_at,
       })
       return tok.access_token
-    })().finally(() => searchRefreshes.delete(vm.id))
+    }).finally(() => searchRefreshes.delete(vm.id))
     searchRefreshes.set(vm.id, pending)
   }
   return pending

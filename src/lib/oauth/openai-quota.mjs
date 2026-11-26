@@ -25,6 +25,7 @@ import {
 import { CODEX_OAUTH_ORIGINATOR, makeProxyFetch, refreshCodexAccessToken } from '../protocol/codex-models.mjs'
 import { openaiIdentityFromJwt } from './openai-jwt.mjs'
 import { expiresAtToMs } from './oauth-credentials.mjs'
+import { withCredentialRefreshLock } from '../transport/go-worker-client.mjs'
 import { codexQuotaWindowReason, isCodexSlotParked } from '../pool/codex-slot-pool.mjs'
 import { openAIAccountHold } from '../pool/openai-account-runtime.mjs'
 import { activeHoursOf, evaluateActiveHours } from '../pool/active-hours.mjs'
@@ -306,12 +307,16 @@ async function quotaFetch(url, { method = 'GET', headers, body, proxyUrl, fetchI
 
 async function rotateIfNeeded(slot, projectRoot, vmId, fetchImpl) {
   if (!slot.refresh) return slot
-  const tok = await refreshCodexAccessToken({
-    refreshToken: slot.refresh,
-    proxyUrl: slot.proxyUrl,
-    fetchImpl,
-    timeoutMs: OPENAI_QUOTA_TIMEOUT_MS,
-  })
+  // 与监视器/面板刷新共锁（key=codex:<vmId>）：串行化同号 RT 消费，防轮换竞态
+  // （后完成者拿旧 RT 重放被拒是小事；写盘 read-modify-write 互相覆盖新票是大事）。
+  const tok = await withCredentialRefreshLock(`codex:${vmId}`, () =>
+    refreshCodexAccessToken({
+      refreshToken: slot.refresh,
+      proxyUrl: slot.proxyUrl,
+      fetchImpl,
+      timeoutMs: OPENAI_QUOTA_TIMEOUT_MS,
+    }),
+  )
   if (!tok.ok) {
     // Surface dead credentials (refresh_rejected / refresh_empty / missing_refresh_token)
     // on the vm ticket instead of failing silently in memory. Transient errors

@@ -57,6 +57,7 @@ import {
   markCodexGrantDead,
 } from '../vm/codex-slot.mjs'
 import { clearOpenAIAccountHold } from '../pool/openai-account-runtime.mjs'
+import { withCredentialRefreshLock } from '../transport/go-worker-client.mjs'
 import { generateAuthUrl, exchangeAuthCode, normalizeOauthFlavor } from '../oauth/oauth-auth-url.mjs'
 import { sessionKeyToOAuth, panelImportErrorPayload } from '../oauth/cookie-auth.mjs'
 import { enrichOauthIdentity } from '../oauth/oauth-identity.mjs'
@@ -6935,10 +6936,13 @@ export function createPanelHandler(ctx) {
               error: { code: 'credential_mode_unsupported', message: 'GPT 槽没有 refresh_token，请重新导入 OAuth' },
             })
           }
-          const tok = await refreshCodexAccessToken({
-            refreshToken,
-            proxyUrl: hostProxyUrlForVm(vm),
-          })
+          // 与监视器/quota 轮换共锁（key=codex:<vmId>）：串行化同号 RT 消费防轮换竞态。
+          const tok = await withCredentialRefreshLock(`codex:${id}`, () =>
+            refreshCodexAccessToken({
+              refreshToken,
+              proxyUrl: hostProxyUrlForVm(vm),
+            }),
+          )
           if (!tok.ok) {
             // 操作员手动刷新=最强的死活证据源：吊销结论立即落盘摘池（面板显示
             // 「不可调度 · 凭证吊销」），其余失败维持现状只回 502。
